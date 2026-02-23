@@ -37,7 +37,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-aitviewer = { path = "aitviewer", editable = true }
+aitviewer = { git = "https://github.com/Angledsugar/aitviewer.git" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

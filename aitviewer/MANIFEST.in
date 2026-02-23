@@ -1,4 +1,0 @@
-recursive-include aitviewer/shaders *
-recursive-include aitviewer/resources *
-
-include aitviewer/aitvconfig.yaml
