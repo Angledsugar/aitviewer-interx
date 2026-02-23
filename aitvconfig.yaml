@@ -1,0 +1,37 @@
+# Local aitviewer configuration for SMPLX visualizer project.
+# This overrides defaults in aitviewer/aitviewer/aitvconfig.yaml
+
+# Path to SMPLX body model files (SMPLX_NEUTRAL.npz, SMPLX_MALE.npz, SMPLX_FEMALE.npz)
+# Download from https://smpl-x.is.tue.mpg.de/
+smplx_models: "./smplx"
+
+# PyTorch device - auto-selects GPU if available.
+device: "cuda:0"
+f_precision: 32
+
+# Viewer window settings.
+window_width: 1600
+window_height: 900
+fullscreen: False
+resizable: True
+
+# Rendering.
+shadows_enabled: True
+dark_mode: False
+backface_culling: True
+background_color: [1.0, 1.0, 1.0, 1.0]
+
+# Camera defaults.
+znear: 0.01
+zfar: 1000.0
+
+# Playback.
+playback_fps: 30
+scene_fps: 30
+run_animations: True
+
+# Export.
+export_dir: "./output"
+
+# Y-up coordinate system.
+z_up: False
