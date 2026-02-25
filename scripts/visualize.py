@@ -27,6 +27,22 @@ sys.path.insert(0, _project_root)
 # Pre-load system GL libraries before moderngl import (workaround for missing -dev symlinks).
 import src.gl_setup  # noqa: F401, E402
 
+# Patch PyQt5Window.resize to handle missing _ctx before GL context init.
+import moderngl_window.context.pyqt5.window as _pyqt5_win
+
+_orig_resize = _pyqt5_win.Window.resize
+
+def _safe_resize(self, width, height):
+    if not hasattr(self, "_ctx"):
+        self._width = width // self._widget.devicePixelRatio()
+        self._height = height // self._widget.devicePixelRatio()
+        self._buffer_width = width
+        self._buffer_height = height
+        return
+    _orig_resize(self, width, height)
+
+_pyqt5_win.Window.resize = _safe_resize
+
 import numpy as np
 
 from aitviewer.configuration import CONFIG as C
