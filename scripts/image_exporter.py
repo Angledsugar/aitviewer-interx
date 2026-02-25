@@ -361,14 +361,27 @@ class HeadlessBackend:
         self.r.export_frame(str(path))
 
     def render_current_frame(self) -> np.ndarray:
-        """Render current frame and return as numpy array (H, W, 3)."""
+        """Render current frame and return as numpy array (H, W, 3).
+        Uses direct framebuffer read, bypassing PIL for speed."""
         self._ensure_init()
         run_animations = self.r.run_animations
         self.r.run_animations = False
         self.r.render(0, 0, export=True)
         self.r.run_animations = run_animations
-        img = self.r.get_current_frame_as_image()
-        return np.array(img)
+
+        # Direct FBO read → numpy (skip PIL Image creation + transpose)
+        renderer = self.r.renderer
+        if renderer.window_type == "headless":
+            renderer.ctx.copy_framebuffer(renderer.headless_fbo, self.r.wnd.fbo)
+            fbo = renderer.headless_fbo
+        else:
+            fbo = self.r.wnd.fbo
+        vp = self.r.wnd.fbo.viewport
+        w = vp[2] - vp[0]
+        h = vp[3] - vp[1]
+        raw = fbo.read(viewport=self.r.wnd.fbo.viewport, alignment=1, components=3)
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)[::-1].copy()
+        return frame
 
     def save_video(self, output_path: str, fps: int, quality: str = "medium"):
         """
