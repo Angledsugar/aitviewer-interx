@@ -653,7 +653,7 @@ def export_clip(
 # -------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--clip-id", type=str, required=True, help="Clip folder name under motions dir (e.g., G001T000A000R000).")
+    ap.add_argument("--clip-id", type=str, default=None, help="Clip folder name (e.g., G001T000A000R000). Omit to process all clips.")
     ap.add_argument("--motions-dir", type=str, default="./motions", help="Directory containing clip folders.")
     ap.add_argument("--out-dir", type=str, default="./exports", help="Output directory root.")
     ap.add_argument("--body-models-dir", type=str, default="./body_models", help="SMPL-X model root (must contain ./smplx).")
@@ -681,6 +681,15 @@ def parse_args():
     return ap.parse_args()
 
 
+def discover_clips(motions_dir: Path) -> list:
+    """Find all clip directories that contain both P1.npz and P2.npz."""
+    clips = sorted([
+        d.name for d in motions_dir.iterdir()
+        if d.is_dir() and (d / "P1.npz").exists() and (d / "P2.npz").exists()
+    ])
+    return clips
+
+
 def main():
     args = parse_args()
 
@@ -691,37 +700,55 @@ def main():
     if not (body_models_dir / "smplx").exists():
         raise FileNotFoundError(f"Expected SMPL-X folder not found: {body_models_dir / 'smplx'}")
 
-    clip_dir = motions_dir / args.clip_id
-    if not clip_dir.exists():
-        raise FileNotFoundError(f"Clip dir not found: {clip_dir}")
+    # Determine clip list
+    if args.clip_id:
+        clip_ids = [args.clip_id]
+        clip_dir = motions_dir / args.clip_id
+        if not clip_dir.exists():
+            raise FileNotFoundError(f"Clip dir not found: {clip_dir}")
+    else:
+        clip_ids = discover_clips(motions_dir)
+        if not clip_ids:
+            raise FileNotFoundError(f"No clips found (P1.npz + P2.npz) under: {motions_dir}")
+        print(f"[INFO] Found {len(clip_ids)} clips to export.")
 
     ensure_dir(out_dir)
 
-    export_clip(
-        clip_id=args.clip_id,
-        motions_dir=motions_dir,
-        out_dir=out_dir,
-        body_models_dir=body_models_dir,
-        w=int(args.width),
-        h=int(args.height),
-        fps=int(args.fps),
-        every_n=max(1, int(args.every_n)),
-        max_frames=args.max_frames,
-        device=args.device,
-        follow_joints=bool(args.follow_joints),
-        idx_root=int(args.idx_root),
-        idx_left_wrist=int(args.idx_left_wrist),
-        idx_right_wrist=int(args.idx_right_wrist),
-        idx_head=int(args.idx_head),
-        idx_left_elbow=int(args.idx_left_elbow),
-        idx_right_elbow=int(args.idx_right_elbow),
-        idx_left_shoulder=int(args.idx_left_shoulder),
-        idx_right_shoulder=int(args.idx_right_shoulder),
-        debug_print_cam0=bool(args.debug_cam0),
-        export_video=bool(args.video),
-        video_format=args.video_format,
-        video_quality=args.video_quality,
-    )
+    for i, clip_id in enumerate(clip_ids):
+        print(f"\n{'='*60}")
+        print(f"[{i+1}/{len(clip_ids)}] {clip_id}")
+        print(f"{'='*60}")
+        try:
+            export_clip(
+                clip_id=clip_id,
+                motions_dir=motions_dir,
+                out_dir=out_dir,
+                body_models_dir=body_models_dir,
+                w=int(args.width),
+                h=int(args.height),
+                fps=int(args.fps),
+                every_n=max(1, int(args.every_n)),
+                max_frames=args.max_frames,
+                device=args.device,
+                follow_joints=bool(args.follow_joints),
+                idx_root=int(args.idx_root),
+                idx_left_wrist=int(args.idx_left_wrist),
+                idx_right_wrist=int(args.idx_right_wrist),
+                idx_head=int(args.idx_head),
+                idx_left_elbow=int(args.idx_left_elbow),
+                idx_right_elbow=int(args.idx_right_elbow),
+                idx_left_shoulder=int(args.idx_left_shoulder),
+                idx_right_shoulder=int(args.idx_right_shoulder),
+                debug_print_cam0=bool(args.debug_cam0),
+                export_video=bool(args.video),
+                video_format=args.video_format,
+                video_quality=args.video_quality,
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to export {clip_id}: {e}")
+            continue
+
+    print(f"\n[DONE] Exported {len(clip_ids)} clip(s) to: {out_dir}")
 
 
 if __name__ == "__main__":
