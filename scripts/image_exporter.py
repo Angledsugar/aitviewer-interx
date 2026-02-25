@@ -383,6 +383,13 @@ class HeadlessBackend:
             ensure_no_overwrite=False,
         )
 
+    def clear_scene(self):
+        """Remove all user-added nodes and reset for next clip."""
+        for node in self.r.scene.nodes.copy():
+            self.r.scene.remove(node)
+        self.r.scene.current_frame_id = 0
+        self._scene_initialized = False
+
     def close(self):
         try:
             self.r.close()
@@ -398,6 +405,7 @@ def export_clip(
     motions_dir: Path,
     out_dir: Path,
     body_models_dir: Path,
+    backend: HeadlessBackend,
     w: int,
     h: int,
     fps: int,
@@ -443,7 +451,7 @@ def export_clip(
     root1 = normalize_rotvec_array(params1["root_orient"], nf1)[:T]
     root2 = normalize_rotvec_array(params2["root_orient"], nf2)[:T]
 
-    backend = HeadlessBackend(w, h, fps)
+    backend.clear_scene()
     backend.add(seq1)
     backend.add(seq2)
 
@@ -645,8 +653,6 @@ def export_clip(
     else:
         print(f"[OK] Done. Saved under: {out_root}")
 
-    backend.close()
-
 
 # -------------------------
 # CLI
@@ -697,8 +703,21 @@ def main():
     out_dir = Path(args.out_dir).resolve()
     body_models_dir = Path(args.body_models_dir).resolve()
 
-    if not (body_models_dir / "smplx").exists():
-        raise FileNotFoundError(f"Expected SMPL-X folder not found: {body_models_dir / 'smplx'}")
+    # aitviewer expects <body_models_dir>/smplx/SMPLX_*.npz
+    # If the smplx subfolder doesn't exist but model files are directly in body_models_dir,
+    # create a symlink so aitviewer can find them.
+    smplx_subdir = body_models_dir / "smplx"
+    if not smplx_subdir.exists():
+        has_models = any(body_models_dir.glob("SMPLX_*.npz")) or any(body_models_dir.glob("SMPLX_*.pkl"))
+        if has_models:
+            smplx_subdir.symlink_to(body_models_dir)
+            print(f"[INFO] Created symlink: {smplx_subdir} -> {body_models_dir}")
+        else:
+            raise FileNotFoundError(
+                f"No SMPL-X models found. Expected either:\n"
+                f"  {smplx_subdir}/SMPLX_*.npz  or\n"
+                f"  {body_models_dir}/SMPLX_*.npz"
+            )
 
     # Determine clip list
     if args.clip_id:
@@ -714,6 +733,9 @@ def main():
 
     ensure_dir(out_dir)
 
+    # Create a single HeadlessBackend and reuse across all clips
+    backend = HeadlessBackend(int(args.width), int(args.height), int(args.fps))
+
     for i, clip_id in enumerate(clip_ids):
         print(f"\n{'='*60}")
         print(f"[{i+1}/{len(clip_ids)}] {clip_id}")
@@ -724,6 +746,7 @@ def main():
                 motions_dir=motions_dir,
                 out_dir=out_dir,
                 body_models_dir=body_models_dir,
+                backend=backend,
                 w=int(args.width),
                 h=int(args.height),
                 fps=int(args.fps),
@@ -748,6 +771,7 @@ def main():
             print(f"[ERROR] Failed to export {clip_id}: {e}")
             continue
 
+    backend.close()
     print(f"\n[DONE] Exported {len(clip_ids)} clip(s) to: {out_dir}")
 
 
