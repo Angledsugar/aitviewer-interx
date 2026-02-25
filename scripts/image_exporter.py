@@ -398,6 +398,86 @@ class HeadlessBackend:
 
 
 # -------------------------
+# Vectorized camera pose precomputation
+# -------------------------
+def precompute_follow_cameras(
+    specs: Dict[str, Dict],
+    joints1: np.ndarray,
+    joints2: np.ndarray,
+    root1: np.ndarray,
+    root2: np.ndarray,
+    T: int,
+    every_n: int,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """
+    Precompute all camera (pos, tgt) for every sampled frame, vectorized.
+    Returns {cam_name: {"pos": (N,3), "tgt": (N,3), "fov": float}}.
+    """
+    frame_indices = np.arange(0, T, every_n)
+    N = len(frame_indices)
+
+    # Batch rotation matrices: (T, 3, 3)
+    Rw1_all = SciR.from_rotvec(root1[frame_indices]).as_matrix().astype(np.float32)
+    Rw2_all = SciR.from_rotvec(root2[frame_indices]).as_matrix().astype(np.float32)
+
+    world_up = np.array([0., 1., 0.], dtype=np.float32)
+
+    result = {}
+    for cam_name, sp in specs.items():
+        who = sp["who"]
+        j = int(sp["j"])
+        off = sp["off"].astype(np.float32)
+        fov = float(sp["fov"])
+
+        pos_arr = np.empty((N, 3), dtype=np.float32)
+        tgt_arr = np.empty((N, 3), dtype=np.float32)
+
+        if who in ("p1", "p2"):
+            joints_p = joints1 if who == "p1" else joints2
+            Rw_all = Rw1_all if who == "p1" else Rw2_all
+            joint_all = joints_p[frame_indices, j, :].astype(np.float32)  # (N, 3)
+
+            if cam_name in ("p1_head", "p2_head"):
+                lsh_all = joints_p[frame_indices, int(sp["j_lsh"]), :].astype(np.float32)
+                rsh_all = joints_p[frame_indices, int(sp["j_rsh"]), :].astype(np.float32)
+                right_vec = rsh_all - lsh_all  # (N, 3)
+                fwd = np.cross(np.tile(world_up, (N, 1)), right_vec)  # (N, 3)
+                fwd_len = np.linalg.norm(fwd, axis=1, keepdims=True)  # (N, 1)
+
+                # Fallback for near-zero forward vectors
+                fallback_fwd = np.einsum("nij,j->ni", Rw_all, np.array([0., 0., 1.], dtype=np.float32))
+                mask = (fwd_len.squeeze() < 1e-6)
+                fwd = np.where(fwd_len > 1e-6, fwd / np.maximum(fwd_len, 1e-8), fallback_fwd)
+
+                # pos = joint + Rw @ off + fwd * 0.15
+                rotated_off = np.einsum("nij,j->ni", Rw_all, off)  # (N, 3)
+                pos_arr = joint_all + rotated_off + fwd * 0.15
+                tgt_arr = joint_all + fwd * 1.0
+            else:
+                elbow_all = joints_p[frame_indices, int(sp["j_elbow"]), :].astype(np.float32)
+                arm_vec = joint_all - elbow_all  # (N, 3)
+                arm_len = np.linalg.norm(arm_vec, axis=1, keepdims=True)
+                arm_dir = np.where(
+                    arm_len > 1e-6,
+                    arm_vec / np.maximum(arm_len, 1e-8),
+                    np.tile(np.array([1., 0., 0.], dtype=np.float32), (N, 1)),
+                )
+                pos_arr = joint_all + arm_dir * 0.15
+                tgt_arr = joint_all + arm_dir * 0.6
+
+        else:  # both_root (topdown)
+            rootj1 = joints1[frame_indices, j, :].astype(np.float32)
+            rootj2 = joints2[frame_indices, j, :].astype(np.float32)
+            center = 0.5 * (rootj1 + rootj2)
+            pos_arr = center + off[np.newaxis, :]
+            tgt_arr = center.copy()
+
+        result[cam_name] = {"pos": pos_arr, "tgt": tgt_arr, "fov": fov}
+
+    return result
+
+
+# -------------------------
 # Export procedure
 # -------------------------
 def export_clip(
@@ -425,6 +505,7 @@ def export_clip(
     export_video: bool = False,
     video_format: str = "mp4",
     video_quality: str = "medium",
+    use_nvenc: bool = False,
 ) -> None:
     clip_dir = motions_dir / clip_id
     p1_path = clip_dir / "P1.npz"
@@ -514,13 +595,13 @@ def export_clip(
     else:
         cam_names = list(specs.keys())  # type: ignore
 
-    out_root = out_dir / clip_id / "observations" / "images"
     if export_video:
-        video_root = out_dir / clip_id / "observations" / "videos"
-    for cam_name in cam_names:
-        ensure_dir(out_root / cam_name)
-        if export_video:
-            ensure_dir(video_root)
+        video_root = out_dir / "videos" / clip_id
+        ensure_dir(video_root)
+    else:
+        out_root = out_dir / clip_id / "observations" / "images"
+        for cam_name in cam_names:
+            ensure_dir(out_root / cam_name)
 
     mode_str = "video" if export_video else "images"
     print(f"[INFO] Export clip={clip_id}, T={T}, cams={len(cam_names)}, every_n={every_n}, device={device}, follow={follow_joints}, mode={mode_str}")
@@ -528,6 +609,14 @@ def export_clip(
     # Optional debug: print first-frame computed poses (computed, not camera object attrs)
     if debug_print_cam0:
         print("=== computed camera poses at frame 0 ===")
+
+    # Precompute camera poses (vectorized) for follow-joints mode
+    precomputed_cams = None
+    if follow_joints and specs is not None and joints1 is not None and joints2 is not None:
+        print("[INFO] Precomputing camera poses (vectorized)...")
+        precomputed_cams = precompute_follow_cameras(
+            specs, joints1, joints2, root1, root2, T, every_n,
+        )
 
     # Initialize video writers (one per camera)
     video_writers = {}
@@ -544,13 +633,24 @@ def export_clip(
                 "-r": str(output_fps),
             }
             if video_format == "mp4":
-                outputdict.update({
-                    "-c:v": "libx264",
-                    "-preset": "slow",
-                    "-profile:v": "high",
-                    "-level:v": "4.0",
-                    "-crf": quality_to_crf.get(video_quality, "28"),
-                })
+                if use_nvenc:
+                    # NVIDIA GPU hardware encoder — much faster than libx264
+                    nvenc_qp = {"high": "20", "medium": "26", "low": "32"}
+                    outputdict.update({
+                        "-c:v": "h264_nvenc",
+                        "-preset": "p4",
+                        "-rc": "constqp",
+                        "-qp": nvenc_qp.get(video_quality, "26"),
+                        "-profile:v": "high",
+                    })
+                else:
+                    outputdict.update({
+                        "-c:v": "libx264",
+                        "-preset": "fast",
+                        "-profile:v": "high",
+                        "-level:v": "4.0",
+                        "-crf": quality_to_crf.get(video_quality, "28"),
+                    })
             video_writers[cam_name] = skvideo.io.FFmpegWriter(
                 video_path,
                 inputdict={"-framerate": str(output_fps)},
@@ -558,11 +658,11 @@ def export_clip(
             )
 
     # Export loop
-    for t in range(0, T, every_n):
+    frame_indices = list(range(0, T, every_n))
+    for fi, t in enumerate(frame_indices):
         backend.set_frame(t)
 
         if not follow_joints:
-            # Fixed cams: create a NEW camera object per render (cache-proof)
             if debug_print_cam0 and t == 0:
                 for k, (p, q, fov) in fixed.items():
                     print(k, "pos=", p, "tgt=", q, "fov=", fov)
@@ -578,61 +678,17 @@ def export_clip(
                     backend.export_frame(frame_path)
 
         else:
-            # Joint-follow: compute pos/tgt per cam per frame, create NEW camera object each time
-            assert specs is not None and joints1 is not None and joints2 is not None
+            # Use precomputed camera poses (vectorized)
+            assert precomputed_cams is not None
 
-            Rw1 = SciR.from_rotvec(root1[t]).as_matrix().astype(np.float32)
-            Rw2 = SciR.from_rotvec(root2[t]).as_matrix().astype(np.float32)
-
-            world_up = np.array([0., 1., 0.], dtype=np.float32)  # Z-up 좌표계
-
-            for cam_name, sp in specs.items():
-                who = sp["who"]
-                j = int(sp["j"])
-                off = sp["off"].astype(np.float32)
-                fov = float(sp["fov"])
-
-                if who in ("p1", "p2"):
-                    joints_p = joints1 if who == "p1" else joints2
-                    Rw = Rw1 if who == "p1" else Rw2
-                    joint = joints_p[t, j, :].astype(np.float32)
-
-                    if cam_name in ("p1_head", "p2_head"):
-                        # Head: 어깨 벡터와 world_up 의 외적으로 정면 방향 계산
-                        lsh = joints_p[t, int(sp["j_lsh"]), :].astype(np.float32)
-                        rsh = joints_p[t, int(sp["j_rsh"]), :].astype(np.float32)
-                        right_vec = rsh - lsh
-                        fwd = np.cross(world_up, right_vec)
-                        fwd_len = np.linalg.norm(fwd)
-                        if fwd_len < 1e-6:
-                            # fallback: root_orient 기반 +Z 방향
-                            fwd = (Rw @ np.array([0., 0., 1.], dtype=np.float32))
-                        else:
-                            fwd = (fwd / fwd_len).astype(np.float32)
-                        pos = joint + (Rw @ off) + fwd * 0.15
-                        tgt = joint + fwd * 1.0
-
-                    else:
-                        # Wrist: elbow -> wrist 팔 벡터 방향으로 바라봄
-                        elbow = joints_p[t, int(sp["j_elbow"]), :].astype(np.float32)
-                        arm_vec = joint - elbow
-                        arm_len = np.linalg.norm(arm_vec)
-                        arm_dir = (arm_vec / arm_len).astype(np.float32) if arm_len > 1e-6 else np.array([1., 0., 0.], dtype=np.float32)
-                        # 팔 방향 기준 5cm 앞: 어느 방향을 향하든 항상 손목 mesh 바깥에 위치
-                        pos = joint + arm_dir * 0.15
-                        tgt = joint + arm_dir * 0.6
-
-                else:  # both_root (topdown)
-                    rootj1 = joints1[t, j, :].astype(np.float32)
-                    rootj2 = joints2[t, j, :].astype(np.float32)
-                    center = 0.5 * (rootj1 + rootj2)
-                    pos = center + off   # off = [0, 0, 3.5] → Z=3.5 위에서
-                    tgt = center         # 중간점을 향해 내려다봄 (-Z 방향)
+            for cam_name, cam_data in precomputed_cams.items():
+                pos = cam_data["pos"][fi]
+                tgt = cam_data["tgt"][fi]
+                fov = cam_data["fov"]
 
                 if debug_print_cam0 and t == 0:
                     print(cam_name, "pos=", pos, "tgt=", tgt, "fov=", fov)
 
-                # ✅ 핵심: NEW camera object for every (t, cam) to avoid internal caching
                 cam = PinholeCamera(pos, tgt, w, h, fov=fov)
                 backend.set_camera(cam)
                 if export_video:
@@ -684,6 +740,7 @@ def parse_args():
     ap.add_argument("--video", action="store_true", help="Export as video instead of per-frame images.")
     ap.add_argument("--video-format", type=str, default="mp4", choices=["mp4", "webm"], help="Video format (default: mp4).")
     ap.add_argument("--video-quality", type=str, default="medium", choices=["high", "medium", "low"], help="Video quality (default: medium). MP4 only.")
+    ap.add_argument("--nvenc", action="store_true", help="Use NVIDIA h264_nvenc GPU encoder (much faster on RTX GPUs).")
     return ap.parse_args()
 
 
@@ -766,6 +823,7 @@ def main():
                 export_video=bool(args.video),
                 video_format=args.video_format,
                 video_quality=args.video_quality,
+                use_nvenc=bool(args.nvenc),
             )
         except Exception as e:
             print(f"[ERROR] Failed to export {clip_id}: {e}")
